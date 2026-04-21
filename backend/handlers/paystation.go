@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"slices"
 	"strings"
@@ -59,7 +60,17 @@ type payStationVirtualItems struct {
 }
 
 type payStationPurchase struct {
-	Description *payStationField `json:"description,omitempty"`
+	Description  *payStationField         `json:"description,omitempty"`
+	VirtualItems *payStationPurchaseItems `json:"virtual_items,omitempty"`
+}
+
+type payStationPurchaseItems struct {
+	Items []payStationPurchaseItem `json:"items,omitempty"`
+}
+
+type payStationPurchaseItem struct {
+	SKU    string `json:"sku"`
+	Amount int64  `json:"amount"`
 }
 
 type payStationTokenResponse struct {
@@ -119,6 +130,16 @@ func (h *StoreHandler) CreatePayment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	item, err := h.service.GetStoreItem(r.Context(), req.SKU)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "unknown sku")
+		return
+	}
+	if item.CurrencyType != "real" {
+		writeError(w, http.StatusBadRequest, "sku is not a real-money item")
+		return
+	}
+
 	tokenReq := payStationTokenRequest{
 		User: payStationUser{
 			ID: payStationField{Value: xsollaUserID},
@@ -154,6 +175,12 @@ func (h *StoreHandler) CreatePayment(w http.ResponseWriter, r *http.Request) {
 	}
 	tokenReq.Purchase = &payStationPurchase{
 		Description: &payStationField{Value: fmt.Sprintf("Purchase %s", req.SKU)},
+		VirtualItems: &payStationPurchaseItems{
+			Items: []payStationPurchaseItem{{
+				SKU:    req.SKU,
+				Amount: int64(math.Round(item.BasePrice * 100)),
+			}},
+		},
 	}
 
 	body, err := json.Marshal(tokenReq)
