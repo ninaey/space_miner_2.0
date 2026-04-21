@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"net/http"
 	"slices"
 	"strings"
@@ -24,6 +23,7 @@ type payStationTokenRequest struct {
 	User             payStationUser      `json:"user"`
 	Settings         payStationSettings  `json:"settings"`
 	Purchase         *payStationPurchase `json:"purchase,omitempty"`
+	Sandbox          bool                `json:"sandbox,omitempty"`
 	CustomParameters map[string]string   `json:"custom_parameters,omitempty"`
 }
 
@@ -43,7 +43,6 @@ type payStationSettings struct {
 	ExternalID string        `json:"external_id,omitempty"`
 	Language   string        `json:"language,omitempty"`
 	Currency   string        `json:"currency,omitempty"`
-	Mode       string        `json:"mode,omitempty"`
 	UI         *payStationUI `json:"ui,omitempty"`
 }
 
@@ -60,8 +59,7 @@ type payStationVirtualItems struct {
 }
 
 type payStationPurchase struct {
-	Description  *payStationField         `json:"description,omitempty"`
-	VirtualItems *payStationPurchaseItems `json:"virtual_items,omitempty"`
+	Items        []payStationPurchaseItem `json:"items,omitempty"`
 }
 
 type payStationPurchaseItems struct {
@@ -70,7 +68,7 @@ type payStationPurchaseItems struct {
 
 type payStationPurchaseItem struct {
 	SKU    string `json:"sku"`
-	Amount int64  `json:"amount"`
+	Quantity int   `json:"quantity"`
 }
 
 type payStationTokenResponse struct {
@@ -150,14 +148,12 @@ func (h *StoreHandler) CreatePayment(w http.ResponseWriter, r *http.Request) {
 			Language:   "en",
 			Currency:   h.payCurrency,
 		},
+		Sandbox: h.sandbox,
 		CustomParameters: map[string]string{
 			"sku":         req.SKU,
 			"player_id":   playerID,
 			"xsolla_user": xsollaUserID,
 		},
-	}
-	if h.sandbox {
-		tokenReq.Settings.Mode = "sandbox"
 	}
 	if h.payCountry != "" {
 		tokenReq.User.Country = &payStationField{Value: h.payCountry}
@@ -174,13 +170,10 @@ func (h *StoreHandler) CreatePayment(w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	tokenReq.Purchase = &payStationPurchase{
-		Description: &payStationField{Value: fmt.Sprintf("Purchase %s", req.SKU)},
-		VirtualItems: &payStationPurchaseItems{
-			Items: []payStationPurchaseItem{{
-				SKU:    req.SKU,
-				Amount: int64(math.Round(item.BasePrice * 100)),
-			}},
-		},
+		Items: []payStationPurchaseItem{{
+			SKU:      req.SKU,
+			Quantity: 1,
+		}},
 	}
 
 	body, err := json.Marshal(tokenReq)
@@ -189,14 +182,14 @@ func (h *StoreHandler) CreatePayment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	url := fmt.Sprintf("https://api.xsolla.com/merchant/v2/merchants/%d/token", h.merchantID)
+	url := fmt.Sprintf("https://store.xsolla.com/api/v3/project/%d/admin/payment/token", h.projectID)
 	httpReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create HTTP request")
 		return
 	}
 
-	credentials := fmt.Sprintf("%d:%s", h.merchantID, h.apiKey)
+	credentials := fmt.Sprintf("%d:%s", h.projectID, h.apiKey)
 	httpReq.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(credentials)))
 	httpReq.Header.Set("Content-Type", "application/json")
 

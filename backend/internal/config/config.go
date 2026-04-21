@@ -43,7 +43,7 @@ func Load() Config {
 		XsollaMerchantID:    merchantID,
 		XsollaAPIKey:        strings.TrimSpace(os.Getenv("XSOLLA_API_KEY")),
 		XsollaSandbox:       sandbox,
-		XsollaPayCountry:    strings.TrimSpace(os.Getenv("XSOLLA_PAY_COUNTRY")),
+		XsollaPayCountry:    getEnv("XSOLLA_PAY_COUNTRY", "US"),
 		XsollaPayCurrency:   getEnv("XSOLLA_PAY_CURRENCY", "USD"),
 		XsollaCatalogURL:    strings.TrimSpace(os.Getenv("XSOLLA_CATALOG_URL")),
 		XsollaWebhookSecret: strings.TrimSpace(os.Getenv("XSOLLA_WEBHOOK_SECRET")),
