@@ -295,7 +295,7 @@ func (h *StoreHandler) XsollaWebhook(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *StoreHandler) handleUserValidation(w http.ResponseWriter, r *http.Request, n webhookNotification) {
-	if n.User == nil || n.User.ID == "" {
+	if n.User == nil || string(n.User.ID) == "" {
 		writeError(w, http.StatusBadRequest, "missing user ID")
 		return
 	}
@@ -305,7 +305,7 @@ func (h *StoreHandler) handleUserValidation(w http.ResponseWriter, r *http.Reque
 }
 
 func (h *StoreHandler) handlePaymentNotification(w http.ResponseWriter, r *http.Request, n webhookNotification) {
-	if n.User == nil || n.User.ID == "" {
+	if n.User == nil || string(n.User.ID) == "" {
 		writeError(w, http.StatusBadRequest, "missing user in payment notification")
 		return
 	}
@@ -315,9 +315,9 @@ func (h *StoreHandler) handlePaymentNotification(w http.ResponseWriter, r *http.
 	}
 
 	isDryRun := n.Transaction.DryRun == 1
-	playerID := n.User.ID
-	if originalPlayerID, ok := n.CustomParameters["player_id"]; ok && strings.TrimSpace(originalPlayerID) != "" {
-		playerID = strings.TrimSpace(originalPlayerID)
+	playerID := string(n.User.ID)
+	if originalPlayerID := customString(n.CustomParameters, "player_id"); originalPlayerID != "" {
+		playerID = originalPlayerID
 	}
 	txnID := n.Transaction.ID
 
@@ -365,9 +365,24 @@ func (h *StoreHandler) handlePaymentNotification(w http.ResponseWriter, r *http.
 
 func (h *StoreHandler) handleRefundNotification(w http.ResponseWriter, n webhookNotification) {
 	if n.Transaction != nil {
-		log.Printf("webhook: refund received for txn=%d user=%s", n.Transaction.ID, n.User.ID)
+		userID := ""
+		if n.User != nil {
+			userID = string(n.User.ID)
+		}
+		log.Printf("webhook: refund received for txn=%d user=%s", n.Transaction.ID, userID)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "accepted"})
+}
+
+func customString(values map[string]any, key string) string {
+	if values == nil {
+		return ""
+	}
+	v, ok := values[key]
+	if !ok || v == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(v))
 }
 
 // verifySignature validates the Xsolla webhook Authorization header.
@@ -378,11 +393,19 @@ func (h *StoreHandler) verifySignature(authHeader string, body []byte) bool {
 		log.Printf("webhook: XSOLLA_WEBHOOK_SECRET not set; skipping signature check")
 		return true
 	}
-	const prefix = "Signature "
-	if !strings.HasPrefix(authHeader, prefix) {
+	authHeader = strings.TrimSpace(authHeader)
+	if authHeader == "" {
 		return false
 	}
-	incoming := strings.TrimPrefix(authHeader, prefix)
+	incoming := authHeader
+	parts := strings.Fields(authHeader)
+	if len(parts) == 2 && strings.EqualFold(parts[0], "Signature") {
+		incoming = parts[1]
+	}
+	incoming = strings.TrimSpace(incoming)
+	if incoming == "" {
+		return false
+	}
 	digest := sha1.New()
 	digest.Write(body)
 	digest.Write([]byte(h.webhookSecret))

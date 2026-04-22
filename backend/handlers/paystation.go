@@ -2,12 +2,14 @@ package handlers
 
 import (
 	"bytes"
+	"encoding"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/netip"
 	"slices"
 	"strings"
 	"time"
@@ -39,27 +41,14 @@ type payStationField struct {
 }
 
 type payStationSettings struct {
-	ProjectID  int           `json:"project_id"`
-	ExternalID string        `json:"external_id,omitempty"`
-	Language   string        `json:"language,omitempty"`
-	Currency   string        `json:"currency,omitempty"`
-	UI         *payStationUI `json:"ui,omitempty"`
-}
-
-type payStationUI struct {
-	Components *payStationComponents `json:"components,omitempty"`
-}
-
-type payStationComponents struct {
-	VirtualItems *payStationVirtualItems `json:"virtual_items,omitempty"`
-}
-
-type payStationVirtualItems struct {
-	SelectedItem string `json:"selected_item,omitempty"`
+	ProjectID  int    `json:"project_id"`
+	ExternalID string `json:"external_id,omitempty"`
+	Language   string `json:"language,omitempty"`
+	Currency   string `json:"currency,omitempty"`
 }
 
 type payStationPurchase struct {
-	Items        []payStationPurchaseItem `json:"items,omitempty"`
+	Items []payStationPurchaseItem `json:"items,omitempty"`
 }
 
 type payStationPurchaseItems struct {
@@ -67,8 +56,8 @@ type payStationPurchaseItems struct {
 }
 
 type payStationPurchaseItem struct {
-	SKU    string `json:"sku"`
-	Quantity int   `json:"quantity"`
+	SKU      string `json:"sku"`
+	Quantity int    `json:"quantity"`
 }
 
 type payStationTokenResponse struct {
@@ -164,10 +153,10 @@ func (h *StoreHandler) CreatePayment(w http.ResponseWriter, r *http.Request) {
 	if player.Email != "" {
 		tokenReq.User.Email = &payStationField{Value: player.Email}
 	}
-	tokenReq.Settings.UI = &payStationUI{
-		Components: &payStationComponents{
-			VirtualItems: &payStationVirtualItems{SelectedItem: req.SKU},
-		},
+	if tokenReq.User.Country == nil && h.sandbox {
+		// Sandbox runs behind local/private addresses often lack geolocation.
+		// A stable fallback country prevents payment-method filtering issues.
+		tokenReq.User.Country = &payStationField{Value: "US"}
 	}
 	tokenReq.Purchase = &payStationPurchase{
 		Items: []payStationPurchaseItem{{
@@ -248,33 +237,15 @@ func (h *StoreHandler) CreatePayment(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// makeXsollaUserID returns a stable, Pay Station-safe user id format.
-// Some payment providers reject ids that start with a digit or contain symbols.
+// makeXsollaUserID keeps the original user ID shape expected by Xsolla Login.
+// Some payment-method checks rely on the same stable user id used in JWT `sub`.
 func makeXsollaUserID(playerID string) string {
-	base := strings.ToLower(strings.TrimSpace(playerID))
-	var b strings.Builder
-	b.Grow(len(base) + 2)
-	b.WriteString("u_")
-
-	for _, r := range base {
-		switch {
-		case r >= 'a' && r <= 'z':
-			b.WriteRune(r)
-		case r >= '0' && r <= '9':
-			b.WriteRune(r)
-		case r == '_':
-			b.WriteRune(r)
-		case r == '-', r == '.', r == '@':
-			b.WriteRune('_')
-		}
+	result := strings.TrimSpace(playerID)
+	if result == "" {
+		return "player"
 	}
-
-	result := b.String()
-	if result == "u_" {
-		result = "u_player"
-	}
-	if len(result) > 64 {
-		result = result[:64]
+	if len(result) > 255 {
+		return result[:255]
 	}
 	return result
 }
@@ -284,18 +255,48 @@ func makeXsollaUserID(playerID string) string {
 func clientIP(r *http.Request) string {
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		if idx := strings.Index(xff, ","); idx >= 0 {
-			return strings.TrimSpace(xff[:idx])
+			ip := strings.TrimSpace(xff[:idx])
+			if isPublicIP(ip) {
+				return ip
+			}
+			return ""
 		}
-		return strings.TrimSpace(xff)
+		ip := strings.TrimSpace(xff)
+		if isPublicIP(ip) {
+			return ip
+		}
+		return ""
 	}
 	if xrip := r.Header.Get("X-Real-Ip"); xrip != "" {
-		return strings.TrimSpace(xrip)
+		ip := strings.TrimSpace(xrip)
+		if isPublicIP(ip) {
+			return ip
+		}
+		return ""
 	}
 	host := r.RemoteAddr
 	if idx := strings.LastIndex(host, ":"); idx >= 0 {
 		host = host[:idx]
 	}
-	return strings.Trim(host, "[]")
+	ip := strings.Trim(host, "[]")
+	if isPublicIP(ip) {
+		return ip
+	}
+	return ""
+}
+
+func isPublicIP(value string) bool {
+	addr, err := netip.ParseAddr(value)
+	if err != nil {
+		return false
+	}
+	if addr.IsLoopback() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast() || addr.IsPrivate() {
+		return false
+	}
+	if addr.IsUnspecified() || addr.IsMulticast() {
+		return false
+	}
+	return true
 }
 
 // ── Webhook notification types and parsing ───────────────────────
@@ -305,13 +306,41 @@ type webhookNotification struct {
 	User             *webhookUser        `json:"user,omitempty"`
 	Transaction      *webhookTransaction `json:"transaction,omitempty"`
 	Purchase         *webhookPurchase    `json:"purchase,omitempty"`
-	CustomParameters map[string]string   `json:"custom_parameters,omitempty"`
+	CustomParameters map[string]any      `json:"custom_parameters,omitempty"`
 }
 
 type webhookUser struct {
-	ID    string `json:"id"`
-	Name  string `json:"name"`
-	Email string `json:"email"`
+	ID    flexibleString `json:"id"`
+	Name  string         `json:"name"`
+	Email string         `json:"email"`
+}
+
+// flexibleString accepts either a JSON string or number and stores it as text.
+// Xsolla webhook docs include both formats for user.id.
+type flexibleString string
+
+var _ json.Unmarshaler = (*flexibleString)(nil)
+var _ encoding.TextMarshaler = flexibleString("")
+
+func (f *flexibleString) UnmarshalJSON(data []byte) error {
+	raw := strings.TrimSpace(string(data))
+	if raw == "" || raw == "null" {
+		*f = ""
+		return nil
+	}
+
+	var asString string
+	if err := json.Unmarshal(data, &asString); err == nil {
+		*f = flexibleString(strings.TrimSpace(asString))
+		return nil
+	}
+
+	*f = flexibleString(strings.Trim(raw, `"`))
+	return nil
+}
+
+func (f flexibleString) MarshalText() ([]byte, error) {
+	return []byte(string(f)), nil
 }
 
 type webhookTransaction struct {
